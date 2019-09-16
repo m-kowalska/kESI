@@ -23,8 +23,10 @@
 ###############################################################################
 import collections
 import logging
+import operator
 
 import numpy as np
+from scipy.interpolate import interp1d
 from scipy.special import lpmv, erf
 
 
@@ -236,8 +238,8 @@ class PolarBase(object):
 
 
 class ElectrodeAware(object):
-    def __init__(self, ROW, ELECTRODES):
-        super(ElectrodeAware, self).__init__(ROW)
+    def __init__(self, ELECTRODES, *args, **kwargs):
+        super(ElectrodeAware, self).__init__(*args, **kwargs)
         self._ELECTRODES = ELECTRODES
 
     def potential(self, electrodes):
@@ -284,11 +286,11 @@ class GaussianSourceKCSD3D(GaussianSourceBase):
     _half = _dtype(0.5)
     _last = 2.
     _err = 1.
-    while _err < _last:
+    while 0 < _err < _last:
         _radius_of_erf_to_x_limit_applicability = _x
         _last = _err
         _x *= _half
-        _err = np.abs(erf(_x) - _fraction_of_erf_to_x_limit_in_0)
+        _err = _fraction_of_erf_to_x_limit_in_0 - erf(_x) / _x
 
     def init(self, x, y, z, ROW):
         super(GaussianSourceKCSD3D, self).init(x, y, z, ROW)
@@ -329,24 +331,14 @@ class ElectrodeAwareCartesianGaussianSourceKCSD3D(ElectrodeAware,
     pass
 
 
-def cv(reconstructor, measured, REGULARIZATION_PARAMETERS):
-    POTS = reconstructor._measurement_vector(measured)
-    KERNEL = reconstructor._kernel
-    n = KERNEL.shape[0]
-    I = np.identity(n - 1)
-    IDX_N = np.arange(n)
+def cv(reconstructor, measured, regularization_parameters):
     errors = []
-    for regularization_parameter in REGULARIZATION_PARAMETERS:
+
+    for regularization_parameter in regularization_parameters:
         logger.info('cv(): error estimation for regularization parameter: {:g}'.format(regularization_parameter))
-        errors.append(0.)
-        for i, p in zip(IDX_N, POTS[:, 0]):
-            IDX = IDX_N[IDX_N != i]
-            K = KERNEL[np.ix_(IDX, IDX)]
-            P = POTS[IDX, :]
-            CK = KERNEL[np.ix_([i], IDX)]
-            EST = np.dot(CK,
-                         np.linalg.solve(K + regularization_parameter * I, P))
-            errors[-1] += (EST[0, 0] - p) ** 2
+        ERR = np.array(reconstructor.leave_one_out_errors(measured,
+                                                          regularization_parameter))
+        errors.append(np.sqrt((ERR**2).mean()))
 
     return errors
 
@@ -372,9 +364,13 @@ else:
 
         POTENTIALS = pd.DataFrame(fh['POTENTIAL'], columns=ELECTRODES.index)
         for k in ['RES', 'DEGREE', 'SIGMA', 'X', 'Y', 'Z', 'INTEGRAL',
-                  'R', 'AZIMUTH', 'ALTITUDE', 'CONDUCTIVITY', 'TIME', 'N']:
+                  'R', 'AZIMUTH', 'ALTITUDE', 'CONDUCTIVITY', 'TIME', 'N',
+                  'WRAP', 'MAX_ITER', 'ITER']:
             if k in fh:
                 POTENTIALS[k] = fh[k]
+
+        if 'ITER' not in POTENTIALS and 'MAX_ITER' in POTENTIALS:
+            POTENTIALS['ITER'] = POTENTIALS.pop('MAX_ITER')
 
         if conductivity is not None:
             POTENTIALS['CONDUCTIVITY'] = conductivity
@@ -383,3 +379,197 @@ else:
             POTENTIALS['CONDUCTIVITY'] = fh['CONDUCTIVITY']
 
         return LoadedPotentials(POTENTIALS, ELECTRODES)
+
+
+
+# MOI sources
+
+
+class _MethodOfImagesSourceBase(object):
+    SourceConfig = collections.namedtuple('SourceConfig',
+                                          ['X',
+                                           'Y',
+                                           'Z',
+                                           'SIGMA',
+                                           'CONDUCTIVITY'])
+
+    def __init__(self, mask_invalid_space):
+        self.mask_invalid_space = mask_invalid_space
+
+    def _mask_invalid_space_if_requested(self, VALUE, MASK, fill_value=0):
+        if self.mask_invalid_space:
+            return np.where(MASK,
+                            VALUE,
+                            fill_value)
+        return VALUE
+
+    def csd(self, X, Y, Z):
+        return self._mask_invalid_space_if_requested(
+                        self._source.csd(X, Y, Z),
+                        self.is_applicable(X, Y, Z))
+
+    def actual_csd(self, X, Y, Z):
+        return self._mask_invalid_space_if_requested(
+                        self._calculate_field('csd', X, Y, Z),
+                        self.is_applicable(X, Y, Z))
+
+    def potential(self, electrodes):
+        return np.where(self.is_applicable(electrodes.X,
+                                           electrodes.Y,
+                                           electrodes.Z),
+                        self._calculate_field('potential', electrodes),
+                        np.nan)
+
+
+class InfiniteSliceSource(_MethodOfImagesSourceBase):
+    """
+    Torbjorn V. Ness (2015)
+    """
+
+    def __init__(self, y, sigma, h, brain_conductivity, saline_conductivity,
+                 glass_conductivity=0,
+                 n=20,
+                 x=0,
+                 z=0,
+                 SourceClass=CartesianGaussianSourceKCSD3D,
+                 mask_invalid_space=True):
+        super(InfiniteSliceSource, self).__init__(mask_invalid_space)
+        self.x = x
+        self.y = y
+        self.z = z
+        self.h = h
+
+        wtg = float(brain_conductivity - glass_conductivity) / (brain_conductivity + glass_conductivity)
+        wts = float(brain_conductivity - saline_conductivity) / (brain_conductivity + saline_conductivity)
+        self.n = n
+        self._source = SourceClass(
+                           self.SourceConfig(x, y, z, sigma, brain_conductivity))
+        weights = [1]
+        sources = [self._source]
+        for i in range(n):
+            weights.append(wtg**i * wts**(i+1))
+            sources.append(SourceClass(
+                               self.SourceConfig(x,
+                                                 2 * (i+1) * h - y,
+                                                 z,
+                                                 sigma,
+                                                 brain_conductivity)))
+            weights.append(wtg**(i+1) * wts**i)
+            sources.append(SourceClass(
+                               self.SourceConfig(x,
+                                                 -2 * i * h - y,
+                                                 z,
+                                                 sigma,
+                                                 brain_conductivity)))
+
+        for i in range(1, n + 1):
+            weights.append((wtg * wts)**i)
+            weights.append((wtg * wts)**i)
+            sources.append(SourceClass(
+                               self.SourceConfig(x,
+                                                 y + 2 * i * h,
+                                                 z,
+                                                 sigma,
+                                                 brain_conductivity)))
+
+            sources.append(SourceClass(
+                               self.SourceConfig(x,
+                                                 y - 2 * i * h,
+                                                 z,
+                                                 sigma,
+                                                 brain_conductivity)))
+
+        self._positive = [(w, s) for w, s in zip(weights, sources)
+                          if w > 0]
+        self._positive.sort(key=operator.itemgetter(0), reverse=False)
+        self._negative = [(w, s) for w, s in zip(weights, sources)
+                          if w < 0]
+        self._negative.sort(key=operator.itemgetter(0), reverse=True)
+
+    def is_applicable(self, X, Y, Z):
+        return (Y >= 0) & (Y < self.h)
+
+    def _calculate_field(self, name, *args, **kwargs):
+        return (sum(w * getattr(s, name)(*args, **kwargs) for w, s in self._positive)
+                + sum(w * getattr(s, name)(*args, **kwargs) for w, s in self._negative))
+
+
+class ElectrodeAwareInfiniteSliceSource(ElectrodeAware, InfiniteSliceSource):
+    pass
+
+
+class HalfSpaceSource(_MethodOfImagesSourceBase):
+    def __init__(self, y, sigma, brain_conductivity, saline_conductivity,
+                 x=0,
+                 z=0,
+                 SourceClass=CartesianGaussianSourceKCSD3D,
+                 mask_invalid_space=True):
+        super(HalfSpaceSource, self).__init__(mask_invalid_space)
+        self.x = x
+        self.y = y
+        self.z = z
+
+        self._source = SourceClass(self.SourceConfig(x, y, z, sigma,
+                                                     brain_conductivity))
+
+        self._image = SourceClass(self.SourceConfig(x, -y, z, sigma,
+                                                    brain_conductivity))
+        self._weight = float(brain_conductivity - saline_conductivity) / (
+                brain_conductivity + saline_conductivity)
+
+    def is_applicable(self, X, Y, Z):
+        return Y < 0
+
+    def _calculate_field(self, name, *args, **kwargs):
+        return (getattr(self._source, name)(*args, **kwargs)
+                + self._weight * getattr(self._image, name)(*args, **kwargs))
+
+
+class ElectrodeAwareHalfSpaceSource(ElectrodeAware, HalfSpaceSource):
+    pass
+
+
+
+# FEM sources
+
+
+class GaussianFEM(object):
+    def __init__(self, ELECTRODES, FEM, FEM_ELECTRODES,
+                 x, y, z, sigma,
+                 _y_min=-np.inf,
+                 _y_max=np.inf):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.sigma = sigma
+        self.y_min = _y_min
+        self.y_max = _y_max
+
+        assert isinstance(sigma, float)
+
+        # # DIRTY HACK:
+        # # I use np.abs(FEM.Y - y) < sigma / 2 as for some reason there is no source at
+        # TMP = FEM[(FEM.SIGMA == sigma) & (np.abs(FEM.Y - y) < sigma / 2)].groupby('R', sort=True).mean()
+        # TMP = FEM[(FEM.SIGMA == sigma) & (FEM.Y == y)].sort_values('R')
+        TMP = FEM[(FEM.SIGMA == sigma) & (np.abs(FEM.Y - y) < sigma * 1e-10)].sort_values('R')
+        interpolate = {el_y: interp1d(TMP.R.values,
+                                                 TMP[name].values,
+                                                 'linear')
+                       for name, el_y in zip(FEM_ELECTRODES.index,
+                                             FEM_ELECTRODES.Y)
+                       }
+        self.ELECTRODES = pd.DataFrame({'R': np.sqrt((self.x - ELECTRODES.X) ** 2
+                                                   + (self.z - ELECTRODES.Z) ** 2),
+                                        'INTERPOLATE': ELECTRODES.Y.apply(interpolate.__getitem__),
+                                        })
+
+    def potential(self, electrodes):
+        return self.ELECTRODES.loc[electrodes].apply(lambda ROW: ROW.INTERPOLATE(ROW.R),
+                                                     axis=1)
+
+    def csd(self, X, Y, Z):
+        return np.where((Y < self.y_max) & (Y > self.y_min),
+                        np.exp(-0.5 / self.sigma**2 * ((X - self.x) ** 2
+                                                       + (Y - self.y) ** 2
+                                                       + (Z - self.z) ** 2)),
+                        0) * (2 * np.pi * self.sigma ** 2) **-1.5
